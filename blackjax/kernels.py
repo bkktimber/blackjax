@@ -20,10 +20,13 @@ __all__ = [
     "orbital_hmc",
     "rmh",
     "sgld",
+    "sghmc",
     "tempered_smc",
     "window_adaptation",
+    "irmh",
     "pathfinder",
     "pathfinder_adaptation",
+    "mgrad_gaussian",
 ]
 
 
@@ -213,7 +216,6 @@ class hmc:
         integrator: Callable = mcmc.integrators.velocity_verlet,
         logprob_grad_fn: Optional[Callable] = None,
     ) -> SamplingAlgorithm:
-
         step = cls.kernel(integrator, divergence_threshold)
 
         def init_fn(position: PyTree):
@@ -292,7 +294,6 @@ class mala:
         logprob_fn: Callable,
         step_size: float,
     ) -> SamplingAlgorithm:
-
         step = cls.kernel()
 
         def init_fn(position: PyTree):
@@ -375,7 +376,6 @@ class nuts:
         integrator: Callable = mcmc.integrators.velocity_verlet,
         logprob_grad_fn: Optional[Callable] = None,
     ) -> SamplingAlgorithm:
-
         step = cls.kernel(integrator, divergence_threshold, max_num_doublings)
 
         def init_fn(position: PyTree):
@@ -392,6 +392,70 @@ class nuts:
             )
 
         return SamplingAlgorithm(init_fn, step_fn)
+
+
+class mgrad_gaussian:
+    """Implements the marginal sampler for latent Gaussian model of [1].
+
+    It uses a first order approximation to the log_likelihood of a model with Gaussian prior.
+    Interestingly, the only parameter that needs calibrating is the "step size" delta, which can be done very efficiently.
+    Calibrating it to have an acceptance rate of roughly 50% is a good starting point.
+
+    Examples
+    --------
+    A new marginal latent Gaussian MCMC kernel for a model q(x) ∝ exp(f(x)) N(x; m, C) can be initialized and
+    used for a given "step size" delta with the following code:
+    .. code::
+
+        mgrad_gaussian = blackjax.mgrad_gaussian(f, C, use_inverse=False, mean=m)
+        state = latent_gaussian.init(zeros)  # Starting at the mean of the prior
+        new_state, info = mgrad_gaussian.step(rng_key, state, delta)
+
+    We can JIT-compile the step function for better performance
+
+    .. code::
+        step = jax.jit(latent_gaussian.step)
+        new_state, info = step(rng_key, state, delta)
+
+    Parameters
+    ----------
+    logprob_fn
+        The logarithm of the likelihood function for the latent Gaussian model.
+    covariance
+        The covariance of the prior Gaussian density.
+    mean: optional
+        Mean of the prior Gaussian density. Default is zero.
+
+    Returns
+    -------
+    A ``SamplingAlgorithm``.
+
+    References
+    ----------
+    [1]: Titsias, M.K. and Papaspiliopoulos, O. (2018), Auxiliary gradient-based sampling algorithms. J. R. Stat. Soc. B, 80: 749-767. https://doi.org/10.1111/rssb.12269
+    """
+
+    def __new__(  # type: ignore[misc]
+        cls,
+        logprob_fn: Callable,
+        covariance: Array,
+        mean: Optional[Array] = None,
+    ) -> SamplingAlgorithm:
+        init, step = mcmc.marginal_latent_gaussian.init_and_kernel(
+            logprob_fn, covariance, mean
+        )
+
+        def init_fn(position: Array):
+            return init(position)
+
+        def step_fn(rng_key: PRNGKey, state, delta: float):
+            return step(
+                rng_key,
+                state,
+                delta,
+            )
+
+        return SamplingAlgorithm(init_fn, step_fn)  # type: ignore[arg-type]
 
 
 # -----------------------------------------------------------------------------
@@ -471,6 +535,83 @@ class sgld:
         def step_fn(rng_key: PRNGKey, state, data_batch: PyTree):
             step_size = schedule_fn(state.step)
             return step(rng_key, state, data_batch, step_size)
+
+        return SamplingAlgorithm(init_fn, step_fn)  # type: ignore[arg-type]
+
+
+class sghmc:
+    """Implements the (basic) user interface for the SGHMC kernel.
+
+    The general sghmc kernel (:meth:`blackjax.mcmc.sghmc.kernel`, alias `blackjax.sghmc.kernel`) can be
+    cumbersome to manipulate. Since most users only need to specify the kernel
+    parameters at initialization time, we provide a helper function that
+    specializes the general kernel.
+
+    Example
+    -------
+
+    To initialize a SGHMC kernel one needs to specify a schedule function, which
+    returns a step size at each sampling step, and a gradient estimator
+    function. Here for a constant step size, and `data_size` data samples:
+
+    .. code::
+
+        schedule_fn = lambda _: 1e-3
+        grad_fn = blackjax.sgmcmc.gradients.grad_estimator(logprior_fn, loglikelihood_fn, data_size)
+
+    We can now initialize the sghmc kernel and the state. Like HMC, SGHMC needs the user to specify a number of integration steps.
+
+    .. code::
+
+        sghmc = blackjax.sghmc(grad_fn, schedule_fn, num_integration_steps)
+        state = sghmc.init(position)
+
+    Assuming we have an iterator `batches` that yields batches of data we can perform one step:
+
+    .. code::
+
+        data_batch = next(batches)
+        new_state = sghmc.step(rng_key, state, data_batch)
+
+    Kernels are not jit-compiled by default so you will need to do it manually:
+
+    .. code::
+
+       step = jax.jit(sghmc.step)
+       new_state, info = step(rng_key, state)
+
+    Parameters
+    ----------
+    gradient_estimator_fn
+       A function which, given a position and a batch of data, returns an estimation
+       of the value of the gradient of the log-posterior distribution at this position.
+    schedule_fn
+       A function which returns a step size given a step number.
+
+    Returns
+    -------
+    A ``SamplingAlgorithm``.
+
+    """
+
+    init = staticmethod(sgmcmc.sgld.init)
+    kernel = staticmethod(sgmcmc.sghmc.kernel)
+
+    def __new__(  # type: ignore[misc]
+        cls,
+        grad_estimator_fn: Callable,
+        schedule_fn: Callable,
+        num_integration_steps: int,
+    ) -> SamplingAlgorithm:
+
+        step = cls.kernel(grad_estimator_fn)
+
+        def init_fn(position: PyTree, data_batch: PyTree):
+            return cls.init(position, data_batch, grad_estimator_fn)
+
+        def step_fn(rng_key: PRNGKey, state, data_batch: PyTree):
+            step_size = schedule_fn(state.step)
+            return step(rng_key, state, data_batch, step_size, num_integration_steps)
 
         return SamplingAlgorithm(init_fn, step_fn)  # type: ignore[arg-type]
 
@@ -631,7 +772,6 @@ class rmh:
         logprob_fn: Callable,
         sigma: Array,
     ) -> SamplingAlgorithm:
-
         step = cls.kernel()
 
         def init_fn(position: PyTree):
@@ -644,6 +784,61 @@ class rmh:
                 logprob_fn,
                 sigma,
             )
+
+        return SamplingAlgorithm(init_fn, step_fn)
+
+
+class irmh:
+    """Implements the (basic) user interface for the independent RMH.
+
+    Examples
+    --------
+
+    A new kernel can be initialized and used with the following code:
+
+    .. code::
+
+        rmh = blackjax.irmh(logprob_fn, proposal_distribution)
+        state = rmh.init(position)
+        new_state, info = rmh.step(rng_key, state)
+
+    We can JIT-compile the step function for better performance
+
+    .. code::
+
+        step = jax.jit(rmh.step)
+        new_state, info = step(rng_key, state)
+
+    Parameters
+    ----------
+    logprob_fn
+        The log density probability density function from which we wish to sample.
+    proposal_distribution
+        A Callable that takes a random number generator and produces a new proposal. The
+        proposal is independent of the sampler's current state.
+
+    Returns
+    -------
+    A ``SamplingAlgorithm``.
+
+    """
+
+    init = staticmethod(mcmc.rmh.init)
+    kernel = staticmethod(mcmc.irmh.kernel)
+
+    def __new__(  # type: ignore[misc]
+        cls,
+        logprob_fn: Callable,
+        proposal_distribution: Callable,
+    ) -> SamplingAlgorithm:
+
+        step = cls.kernel(proposal_distribution)
+
+        def init_fn(position: PyTree):
+            return cls.init(position, logprob_fn)
+
+        def step_fn(rng_key: PRNGKey, state):
+            return step(rng_key, state, logprob_fn)
 
         return SamplingAlgorithm(init_fn, step_fn)
 
@@ -696,7 +891,6 @@ class orbital_hmc:
         *,
         bijection: Callable = mcmc.integrators.velocity_verlet,
     ) -> SamplingAlgorithm:
-
         step = cls.kernel(bijection)
 
         def init_fn(position: PyTree):
@@ -749,7 +943,6 @@ class elliptical_slice:
         mean: Array,
         cov: Array,
     ) -> SamplingAlgorithm:
-
         step = cls.kernel(cov, mean)
 
         def init_fn(position: PyTree):
