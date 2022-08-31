@@ -4,11 +4,18 @@ When you add a new sampling fuctions, please add an Exmaple Notebook to describe
 
 ## Converting Notebook Files to Text Files
 
-Please convert your `.ipynb` to `markdown` before commit your example to this repo. You can use the command below:
+If you implemented your example in a notebook you can convert your `.ipynb` file to Markdown using the command below:
 
 ```python
 jupytext example/your_example_notebook.ipynb --to myst
 ```
+
+Once the example file is converted to a Markdown file, you have two options for editing:
+
+1. Edit the Markdown version as it is a regular Markdown file.
+2. Edit the Notebook version then convert it to a Markdown file once you finish editing with the command above. Jupytext can handle the change if the example has the same file name.  
+   To convert `Markdown` file back to Notebook, you can use:  
+   `jupytext examples/your_example_file.md --to notebook`
 
 The script will produce the `Markdown` version of your example notebook. Please make sure you add only the `Markdown` version to your commit.
 
